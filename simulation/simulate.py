@@ -94,64 +94,6 @@ def bivariate_nb_sarmanov_r_theta(
 
     return y1, y2
 
-# --------------------------
-# 4) generate cell gene matrix：
-#   - n_pos_pairs (lambda >0)
-#   - n_neg_pairs (lambda <0)
-#   - n_random dependent genes
-# --------------------------
-# def simulate_genes_bivariateNB(
-#     n_cells,
-#     n_pos_pairs,
-#     n_neg_pairs,
-#     n_random,
-#     r_range=(2.0, 10.0),
-#     theta_range=(0.1, 0.6),
-#     lambda_pos=0.2,
-#     lambda_neg=-0.2,
-#     rng=None
-# ):
-#     rng = np.random.default_rng() if rng is None else rng
-
-#     genes = []
-#     gene_info = []  
-
-#     def draw_params():
-#         r = rng.uniform(*r_range)
-#         theta = rng.uniform(*theta_range)
-#         return r, theta
-
-#     # positive pairs
-#     for k in range(n_pos_pairs):
-#         r1, th1 = draw_params()
-#         r2, th2 = draw_params()
-#         y1, y2 = bivariate_nb_sarmanov_r_theta(
-#             n_cells, r1, th1, r2, th2, lambda_pos, rng=rng
-#         )
-#         genes.append(y1)
-#         genes.append(y2)
-#         gene_info.append(("pos_pair", k, (r1, th1, r2, th2, lambda_pos)))
-
-#     # negative pairs
-#     for k in range(n_neg_pairs):
-#         r1, th1 = draw_params()
-#         r2, th2 = draw_params()
-#         y1, y2 = bivariate_nb_sarmanov_r_theta(
-#             n_cells, r1, th1, r2, th2, lambda_neg, rng=rng
-#         )
-#         genes.append(y1)
-#         genes.append(y2)
-#         gene_info.append(("neg_pair", k, (r1, th1, r2, th2, lambda_neg)))
-
-#     # dependent genes
-    # for k in range(n_random):
-    #     r, th = draw_params()
-    #     y = sample_nb_r_theta(r, th, size=n_cells, rng=rng)
-    #     genes.append(y)
-    #     gene_info.append(("random", k, (r, th)))
-
-    # X = np.stack(genes, axis=1)  # shape: (n_cells, n_genes)
-    # return X, gene_info
 
 
 def simulate_genes(
@@ -205,10 +147,17 @@ def simulate_genes(
         gene_info.append(("neg_pair", k, (r1, th1, r2, th2, lambda_neg)))
 
     # dependent genes
-    for k, (r, th) in enumerate(rand_params):
-        y = sample_nb_r_theta(r, th, size=n_cells, rng=rng)
-        genes.append(y)
-        gene_info.append(("random", k, (r, th)))
+    # for k, (r, th) in enumerate(rand_params):
+    #     y = sample_nb_r_theta(r, th, size=n_cells, rng=rng)
+    #     genes.append(y)
+    #     gene_info.append(("random", k, (r, th)))
+    for k, (r1, th1, r2, th2) in enumerate(rand_params):
+        y1, y2 = bivariate_nb_sarmanov_r_theta(
+            n_cells, r1, th1, r2, th2, 0, rng=rng
+        )
+        genes.append(y1)
+        genes.append(y2)
+        gene_info.append(("random_pair", k, (r1, th1, r2, th2, lambda_neg)))
 
     X = np.stack(genes, axis=1) if len(genes) > 0 else np.empty((n_cells, 0), dtype=int)
     return X, gene_info
