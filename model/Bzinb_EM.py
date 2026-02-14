@@ -1,4 +1,7 @@
 import numpy as np
+import scanpy as sc
+import pandas as pd
+import scipy.sparse
 from scipy.special import gammaln
 from scipy.optimize import minimize
 import warnings
@@ -16,7 +19,7 @@ class Smart_Initializer:
         n3 = np.sum((y1 == 0) & (y2 > 0))  # G2 Only
         n4 = np.sum((y1 == 0) & (y2 == 0))  # Both Zero
 
-        counts = np.array([n1, n2, n3, n4]) + 1.0  # 加平滑
+        counts = np.array([n1, n2, n3, n4]) + max(1.0, N*0.01)
         return counts / np.sum(counts)
 
     @staticmethod
@@ -30,12 +33,13 @@ class Smart_Initializer:
         p0 = np.sum(y == 0) / n
 
         # 估计 pi
-        pi_hat = min(p0, 0.9)
+        pi_hat = min(p0, 0.95)
 
         # 还原 NB 均值和方差
         mu_nb = mean_val / (1 - pi_hat + 1e-6)
         inflation_term = pi_hat * (1 - pi_hat) * (mu_nb ** 2)
         var_nb = (var_val - inflation_term) / (1 - pi_hat + 1e-6)
+        var_nb = max(var_nb , mu_nb + 1e-4)
 
         # 计算 m 和 theta
         if var_nb > mu_nb:
@@ -44,13 +48,18 @@ class Smart_Initializer:
             m_init = 1.0
 
         theta_init = (m_init * mu_nb) / (1 + m_init * mu_nb)
+
+        if theta_init < 0.05: theta_init = 0.1
+        if m_init < 0.1: m_init = 0.5
+
         return m_init, theta_init
 
 
 class BZINB_Model:
-    def __init__(self, tol=1e-4, max_iter=50):
+    def __init__(self, tol=1e-4, max_iter=50,lambda_reg=0.2):
         self.tol = tol
         self.max_iter = max_iter
+        self.lambda_reg = lambda_reg
         self.params = {}
         self.pis = None
 
@@ -130,7 +139,7 @@ class BZINB_Model:
                 corr = np.maximum(1 + lam * term1 * term2_fixed, 1e-10)
                 return -(ll_nb + np.sum(w_corr * np.log(corr)))
 
-            res1 = minimize(loss_g1, [m1, t1], bounds=[(1e-4, 20), (1e-4, 0.999)], method='L-BFGS-B')
+            res1 = minimize(loss_g1, [m1, t1], bounds=[(0.01, 20), (0.01, 0.999)], method='L-BFGS-B')
             self.params['m1'], self.params['t1'] = res1.x
 
             # 优化 Gene 2
@@ -143,7 +152,7 @@ class BZINB_Model:
                 corr = np.maximum(1 + lam * term1_fixed * term2, 1e-10)
                 return -(ll_nb + np.sum(w_corr * np.log(corr)))
 
-            res2 = minimize(loss_g2, [m2, t2], bounds=[(1e-4, 20), (1e-4, 0.999)], method='L-BFGS-B')
+            res2 = minimize(loss_g2, [m2, t2], bounds=[(0.01, 20), (0.01, 0.999)], method='L-BFGS-B')
             self.params['m2'], self.params['t2'] = res2.x
 
             # 优化 Lambda
@@ -152,7 +161,9 @@ class BZINB_Model:
 
             def loss_lam(l):
                 corr = np.maximum(1 + l[0] * term1_final * term2_final, 1e-10)
-                return -np.sum(gamma[:, 0] * np.log(corr))
+                nll = -np.sum(gamma[:, 0] * np.log(corr))
+                penalty = self.lambda_reg * (l[0]**2)
+                return nll + penalty
 
             res_lam = minimize(loss_lam, [lam], bounds=[(-10, 10)], method='L-BFGS-B')
             self.params['lam'] = res_lam.x[0]
@@ -165,13 +176,3 @@ class BZINB_Model:
 
         return self.params, self.pis
 
-
-# Test
-if __name__ == "__main__":
-    # 随便的一个示例（输入两个基因的向量，输出参数的dict）
-    y1 = np.array([0, 0, 5, 10, 0, 20, 0, 3, 4, 0])
-    y2 = np.array([0, 0, 4, 12, 0, 0, 5, 2, 0, 1])
-
-    model = BZINB_Model()
-
-    params, pis = model.fit(y1, y2)
