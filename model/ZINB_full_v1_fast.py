@@ -64,6 +64,21 @@ class BZINB_Model:
         c = base ** (1 / m)
         return np.exp(-y) - c
 
+    def compute_rho(self, m1, t1, m2, t2, lam):
+        e_inv = np.exp(-1)
+
+        c1 = ((1 - t1) / (1 - t1 * e_inv)) ** (1 / m1)
+        c2 = ((1 - t2) / (1 - t2 * e_inv)) ** (1 / m2)
+
+        A1 = (1/m1) * t1 * e_inv / (1 - t1 * e_inv) - (1/m1) * t1 / (1 - t1)
+        A2 = (1/m2) * t2 * e_inv / (1 - t2 * e_inv) - (1/m2) * t2 / (1 - t2)
+
+        sigma1 = np.sqrt((1/m1) * t1 / (1 - t1)**2)
+        sigma2 = np.sqrt((1/m2) * t2 / (1 - t2)**2)
+
+        rho = lam * c1 * c2 * A1 * A2 / (sigma1 * sigma2 + 1e-12)
+        return rho
+
     def bnb_logpmf(self, y1, y2, m1, t1, m2, t2, lam):
         log_p1 = self.nb_logpmf(y1, m1, t1)
         log_p2 = self.nb_logpmf(y2, m2, t2)
@@ -74,12 +89,12 @@ class BZINB_Model:
 
     def fit(self, y1, y2, constraint=None, init_params=None):
         pis = Smart_Initializer.init_pis_by_counts(y1, y2)
-        
+
         if constraint == 'p2_0': pis[1] = 0.0
         elif constraint == 'p3_0': pis[2] = 0.0
         elif constraint == 'p2p3_0': pis[1] = 0.0; pis[2] = 0.0
         elif constraint == 'p1_0': pis[0] = 0.0
-        pis = pis / (np.sum(pis) + 1e-10) 
+        pis = pis / (np.sum(pis) + 1e-10)
 
         if init_params is not None:
             params = init_params.copy()
@@ -87,8 +102,7 @@ class BZINB_Model:
             m1_in, t1_in = Smart_Initializer.get_marginal_zinb_params(y1)
             m2_in, t2_in = Smart_Initializer.get_marginal_zinb_params(y2)
             params = {'m1': m1_in, 't1': t1_in, 'm2': m2_in, 't2': t2_in, 'lam': 0.0}
-        
-        log_lik_history = []
+
         curr_ll = -np.inf
 
         for iteration in range(self.max_iter):
@@ -101,54 +115,15 @@ class BZINB_Model:
             total_prob = p1 + p2 + p3 + p4 + 1e-20
             gamma = np.vstack([p1, p2, p3, p4]) / total_prob
             gamma = gamma.T
-
             pis = gamma.mean(axis=0)
 
-            w1 = gamma[:, 0] + gamma[:, 2] 
-            w_corr = gamma[:, 0]
-            term2_fixed = self.get_famoye_term(y2, params['m2'], params['t2'])
-
-            def loss_g1(p):
-                ll_nb = np.sum(w1 * self.nb_logpmf(y1, p[0], p[1]))
-                corr = np.maximum(1 + params['lam'] * self.get_famoye_term(y1, p[0], p[1]) * term2_fixed, 1e-10)
-                return -(ll_nb + np.sum(w_corr * np.log(corr)))
-
-            res1 = minimize(loss_g1, [params['m1'], params['t1']], bounds=[(0.01, 20), (0.01, 0.999)], 
-                            method='Nelder-Mead', options=self.opt_options)
-            params['m1'], params['t1'] = res1.x
-
-            w2 = gamma[:, 0] + gamma[:, 1] 
-            term1_fixed = self.get_famoye_term(y1, params['m1'], params['t1'])
-
-            def loss_g2(p):
-                ll_nb = np.sum(w2 * self.nb_logpmf(y2, p[0], p[1]))
-                corr = np.maximum(1 + params['lam'] * term1_fixed * self.get_famoye_term(y2, p[0], p[1]), 1e-10)
-                return -(ll_nb + np.sum(w_corr * np.log(corr)))
-
-            res2 = minimize(loss_g2, [params['m2'], params['t2']], bounds=[(0.01, 20), (0.01, 0.999)], 
-                            method='Nelder-Mead', options=self.opt_options)
-            params['m2'], params['t2'] = res2.x
-
-            t1_f, t2_f = self.get_famoye_term(y1, params['m1'], params['t1']), self.get_famoye_term(y2, params['m2'], params['t2'])
-            def loss_lam(l):
-                corr = np.maximum(1 + l[0] * t1_f * t2_f, 1e-10)
-                return -np.sum(gamma[:, 0] * np.log(corr)) + self.lambda_reg * (l[0]**2)
-
-            res_lam = minimize(loss_lam, [params['lam']], bounds=[(-10, 10)], 
-                               method='Nelder-Mead', options=self.opt_options)
-            params['lam'] = res_lam.x[0]
-
             curr_ll = np.sum(np.log(total_prob))
-            log_lik_history.append(curr_ll)
-            if iteration > 0 and abs(log_lik_history[-1] - log_lik_history[-2]) < self.tol:
-                break
-
         return params, pis, curr_ll
 
-# =====================================================================
-# 模块 2: 推断函数与 Worker 进程封装
-# =====================================================================
 
+# =====================================================================
+# 推断部分
+# =====================================================================
 def step1_univariate_filter(X, gene_names, corr_threshold=0.8):
     n_genes = X.shape[1]
     exog = np.ones((X.shape[0], 1))
@@ -180,38 +155,55 @@ def step1_univariate_filter(X, gene_names, corr_threshold=0.8):
 
 def lrt_pvalue(ll_full, ll_constrained, df):
     D = max(2 * (ll_full - ll_constrained), 0)
-    return 0.5 * stats.chi2.sf(D, df) 
+    return 0.5 * stats.chi2.sf(D, df)
+
 
 def step3_bivariate_decision(yA, yB, marginal_A, marginal_B, alpha=0.05):
-    model_full = BZINB_Model(max_iter=20)
-    model_restr = BZINB_Model(max_iter=10) 
-    
-    try:
-        init_p = {'m1': marginal_A[0], 't1': marginal_A[1], 'm2': marginal_B[0], 't2': marginal_B[1], 'lam': 0.0}
-        
-        params_f, _, ll_full = model_full.fit(yA, yB, constraint=None, init_params=init_p)
-        _, _, ll_p2_0 = model_restr.fit(yA, yB, constraint='p2_0', init_params=params_f)
-        _, _, ll_p3_0 = model_restr.fit(yA, yB, constraint='p3_0', init_params=params_f)
-        _, _, ll_p2p3_0 = model_restr.fit(yA, yB, constraint='p2p3_0', init_params=params_f)
-        _, _, ll_p1_0 = model_restr.fit(yA, yB, constraint='p1_0', init_params=params_f)
-        
-        accept_p2 = lrt_pvalue(ll_full, ll_p2_0, df=1) > alpha
-        accept_p3 = lrt_pvalue(ll_full, ll_p3_0, df=1) > alpha
-        
-        if accept_p2 and accept_p3:
-            if lrt_pvalue(ll_full, ll_p2p3_0, df=2) > alpha: return "Binary Co-expression (共表达)"
-        if accept_p2 and not accept_p3: return "A Contains B (A包含B)"
-        if accept_p3 and not accept_p2: return "B Contains A (B包含A)"
-        if lrt_pvalue(ll_full, ll_p1_0, df=1) > alpha: return "Mutual Exclusivity (互斥)"
-            
-        lam_val = params_f['lam']
-        if abs(lam_val) > 0.1: 
-            if lam_val > 0: return "Continuous Synergistic (连续协同)"
-            else: return "Continuous Antagonistic (连续拮抗/矛盾关系)"
-                
-        return "Independent (独立无关)"
-    except Exception:
-        return "Independent (独立无关)" 
+    model_full = BZINB_Model()
+    model_restr = BZINB_Model()
+
+    init_p = {'m1': marginal_A[0], 't1': marginal_A[1],
+              'm2': marginal_B[0], 't2': marginal_B[1], 'lam': 0.0}
+
+    params_f, _, ll_full = model_full.fit(yA, yB, init_params=init_p)
+    _, _, ll_p2_0 = model_restr.fit(yA, yB, constraint='p2_0', init_params=params_f)
+    _, _, ll_p3_0 = model_restr.fit(yA, yB, constraint='p3_0', init_params=params_f)
+    _, _, ll_p2p3_0 = model_restr.fit(yA, yB, constraint='p2p3_0', init_params=params_f)
+    _, _, ll_p1_0 = model_restr.fit(yA, yB, constraint='p1_0', init_params=params_f)
+
+    accept_p2 = lrt_pvalue(ll_full, ll_p2_0, 1) > alpha
+    accept_p3 = lrt_pvalue(ll_full, ll_p3_0, 1) > alpha
+    accept_p2p3 = lrt_pvalue(ll_full, ll_p2p3_0, 2) > alpha
+
+    # 共表达
+    if accept_p2 and accept_p3 and accept_p2p3:
+        return "Binary Co-expression (共表达)"
+
+    # 包含（XOR）
+    if accept_p2 ^ accept_p3:
+        if accept_p2:
+            return "A Contains B (A包含B)"
+        else:
+            return "B Contains A (B包含A)"
+
+    # 互斥
+    if lrt_pvalue(ll_full, ll_p1_0, 1) > alpha:
+        return "Mutual Exclusivity (互斥)"
+
+    # 连续关系（使用 rho）
+    rho_val = model_full.compute_rho(
+        params_f['m1'], params_f['t1'],
+        params_f['m2'], params_f['t2'],
+        params_f['lam']
+    )
+
+    if abs(rho_val) > 0.05:
+        if rho_val > 0:
+            return "Continuous Synergistic (连续协同)"
+        else:
+            return "Continuous Antagonistic (连续拮抗)"
+
+    return "Independent (独立无关)"
 
 # 【新增】：多进程 Worker 函数
 def process_single_pair(task_tuple, X, marginals_dict, gene_names):
@@ -238,27 +230,41 @@ def process_single_pair(task_tuple, X, marginals_dict, gene_names):
     )
     return {'Gene_A': name_A, 'Gene_B': name_B, 'Relationship': relation}
 
-def build_three_matrices(results, passed_genes):
-    mat_binary = pd.DataFrame(0, index=passed_genes, columns=passed_genes)
-    mat_directed = pd.DataFrame(0, index=passed_genes, columns=passed_genes)
-    mat_continuous = pd.DataFrame(0, index=passed_genes, columns=passed_genes)
-    
+
+# =====================================================================
+# 构建完整矩阵（包含全部基因）
+# =====================================================================
+
+def build_three_matrices(results, all_genes):
+    # 使用所有 480 个基因初始化全零矩阵
+    mat_binary = pd.DataFrame(0, index=all_genes, columns=all_genes)
+    mat_directed = pd.DataFrame(0, index=all_genes, columns=all_genes)
+    mat_continuous = pd.DataFrame(0, index=all_genes, columns=all_genes)
+
     for row in results:
-        g_A, g_B, rel = row['Gene_A'], row['Gene_B'], row['Relationship']
-        if rel == "Binary Co-expression (共表达)":
-            mat_binary.loc[g_A, g_B] = 1; mat_binary.loc[g_B, g_A] = 1
-        elif rel == "Mutual Exclusivity (互斥)":
-            mat_binary.loc[g_A, g_B] = -1; mat_binary.loc[g_B, g_A] = -1
-        elif rel == "A Contains B (A包含B)":
-            mat_directed.loc[g_A, g_B] = 1 
-        elif rel == "B Contains A (B包含A)":
-            mat_directed.loc[g_B, g_A] = 1
-        elif rel == "Continuous Synergistic (连续协同)":
-            mat_continuous.loc[g_A, g_B] = 1; mat_continuous.loc[g_B, g_A] = 1
-        elif rel == "Continuous Antagonistic (连续拮抗/矛盾关系)":
-            mat_continuous.loc[g_A, g_B] = -1; mat_continuous.loc[g_B, g_A] = -1
+        gA, gB, rel = row['Gene_A'], row['Gene_B'], row['Relationship']
+        
+        # 只有当基因在 all_genes 列表里时才填值（双重保险）
+        if gA in mat_binary.index and gB in mat_binary.columns:
+            if rel == "Binary Co-expression (共表达)":
+                mat_binary.loc[gA, gB] = 1
+                mat_binary.loc[gB, gA] = 1
+            elif rel == "Mutual Exclusivity (互斥)":
+                mat_binary.loc[gA, gB] = -1
+                mat_binary.loc[gB, gA] = -1
+            elif rel == "A Contains B (A包含B)":
+                mat_directed.loc[gA, gB] = 1
+            elif rel == "B Contains A (B包含A)":
+                mat_directed.loc[gB, gA] = 1
+            elif rel == "Continuous Synergistic (连续协同)":
+                mat_continuous.loc[gA, gB] = 1
+                mat_continuous.loc[gB, gA] = 1
+            elif rel == "Continuous Antagonistic (连续拮抗)":
+                mat_continuous.loc[gA, gB] = -1
+                mat_continuous.loc[gB, gA] = -1
 
     return mat_binary, mat_directed, mat_continuous
+
 
 # =====================================================================
 # 主流程 (多核并行版)
@@ -322,7 +328,7 @@ def main():
     # 【核心修改】：获取服务器核心数并启动进程池
     # 自动探测 CPU 核心，保留一个核给系统以免服务器卡死
     n_cores = max(1, mp.cpu_count() - 1)
-    print(f"🚀 检测到服务器，已启动 {n_cores} 个 Worker 进程火力全开！")
+    print(f"检测到服务器，已启动 {n_cores} 个 Worker 进程")
     
     # 绑定全局参数到 worker 函数
     worker = partial(process_single_pair, X=X, marginals_dict=marginals_dict, gene_names=gene_names)
@@ -336,7 +342,7 @@ def main():
             
     # 5. 保存结果
     print("\n--- 构建并保存三大邻接矩阵 ---")
-    mat_binary, mat_directed, mat_continuous = build_three_matrices(results, passed_genes)
+    mat_binary, mat_directed, mat_continuous = build_three_matrices(results, gene_names)
     
     mat_binary.to_csv("Matrix_1_Binary_CoBursting.csv")
     mat_directed.to_csv("Matrix_2_Directional_Inclusion.csv")
