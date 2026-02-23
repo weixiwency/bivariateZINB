@@ -9,6 +9,7 @@ from statsmodels.discrete.count_model import ZeroInflatedNegativeBinomialP
 from tqdm import tqdm
 import multiprocessing as mp
 from functools import partial
+from scipy.special import expit, logit, logsumexp
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -22,8 +23,8 @@ class Smart_Initializer:
     def init_pis_by_counts(y1, y2):
         N = len(y1)
         n1 = np.sum((y1 > 0) & (y2 > 0))  
-        n2 = np.sum((y1 == 0) & (y2 > 0)) 
-        n3 = np.sum((y1 > 0) & (y2 == 0)) 
+        n2 = np.sum((y1 > 0) & (y2 == 0)) 
+        n3 = np.sum((y1 == 0) & (y2 > 0)) 
         n4 = np.sum((y1 == 0) & (y2 == 0))  
         counts = np.array([n1, n2, n3, n4]) + max(1.0, N*0.01)
         return counts / np.sum(counts)
@@ -45,13 +46,47 @@ class Smart_Initializer:
 
 
 class BZINB_Model:
-    def __init__(self, tol=1e-3, max_iter=20, lambda_reg=0.2): 
+    def __init__(self, tol=1e-4, max_iter=50, lambda_reg=0.2):
         self.tol = tol
         self.max_iter = max_iter
         self.lambda_reg = lambda_reg
-        self.opt_options = {'maxiter': 3, 'xatol': 1e-1, 'fatol': 1e-1} 
+        self.params = {}
+        self.pis = None
+
+    # def _safe_log(self, x, eps=1e-300):
+    #     # 避免 log(0)
+    #     return np.log(np.maximum(x, eps))
+    
+    def _lam_feasible_bounds(self, A, eps=1e-10, base_bounds=(-10.0, 10.0)):
+        """
+        给定 A_i = term1_i * term2_i，求 lam 的区间，使得对所有 i:
+            1 + lam * A_i >= eps
+        返回 (lb, ub)。如果区间不可行，返回 (None, None)。
+        """
+        A = np.asarray(A, dtype=float)
+        lb, ub = -np.inf, np.inf
+
+        pos = A > 0
+        neg = A < 0
+
+        # 对 A_i > 0: lam >= (-1 + eps)/A_i
+        if np.any(pos):
+            lb = max(lb, np.max((-1.0 + eps) / A[pos]))
+
+        # 对 A_i < 0: lam <= (1 - eps)/(-A_i)
+        if np.any(neg):
+            ub = min(ub, np.min((1.0 - eps) / (-A[neg])))
+
+        # 与用户原来的 base_bounds 取交集
+        lb = max(lb, base_bounds[0])
+        ub = min(ub, base_bounds[1])
+
+        if not np.isfinite(lb) or not np.isfinite(ub) or lb >= ub:
+            return None, None
+        return lb, ub
 
     def nb_logpmf(self, y, m, theta):
+        """单变量 NB Log"""
         theta = np.clip(theta, 1e-6, 1 - 1e-6)
         m = np.clip(m, 1e-6, 1e4)
         r = 1.0 / m
@@ -59,27 +94,14 @@ class BZINB_Model:
         return coeff + y * np.log(theta) + r * np.log(1 - theta)
 
     def get_famoye_term(self, y, m, t):
+        """修正项辅助变量"""
         e_inv = np.exp(-1)
         base = (1 - t) / (1 - t * e_inv)
         c = base ** (1 / m)
         return np.exp(-y) - c
 
-    def compute_rho(self, m1, t1, m2, t2, lam):
-        e_inv = np.exp(-1)
-
-        c1 = ((1 - t1) / (1 - t1 * e_inv)) ** (1 / m1)
-        c2 = ((1 - t2) / (1 - t2 * e_inv)) ** (1 / m2)
-
-        A1 = (1/m1) * t1 * e_inv / (1 - t1 * e_inv) - (1/m1) * t1 / (1 - t1)
-        A2 = (1/m2) * t2 * e_inv / (1 - t2 * e_inv) - (1/m2) * t2 / (1 - t2)
-
-        sigma1 = np.sqrt((1/m1) * t1 / (1 - t1)**2)
-        sigma2 = np.sqrt((1/m2) * t2 / (1 - t2)**2)
-
-        rho = lam * c1 * c2 * A1 * A2 / (sigma1 * sigma2 + 1e-12)
-        return rho
-
     def bnb_logpmf(self, y1, y2, m1, t1, m2, t2, lam):
+        """双变量 BNB Log"""
         log_p1 = self.nb_logpmf(y1, m1, t1)
         log_p2 = self.nb_logpmf(y2, m2, t2)
         term1 = self.get_famoye_term(y1, m1, t1)
@@ -87,38 +109,167 @@ class BZINB_Model:
         correction = np.maximum(1 + lam * term1 * term2, 1e-10)
         return log_p1 + log_p2 + np.log(correction)
 
-    def fit(self, y1, y2, constraint=None, init_params=None):
-        pis = Smart_Initializer.init_pis_by_counts(y1, y2)
+    def _apply_constraint_to_pis(self, pis, constraint):
+        pis = np.array(pis, dtype=float)
 
-        if constraint == 'p2_0': pis[1] = 0.0
-        elif constraint == 'p3_0': pis[2] = 0.0
-        elif constraint == 'p2p3_0': pis[1] = 0.0; pis[2] = 0.0
-        elif constraint == 'p1_0': pis[0] = 0.0
-        pis = pis / (np.sum(pis) + 1e-10)
+        if constraint == 'p2_0':
+            pis[1] = 1e-4
+        elif constraint == 'p3_0':
+            pis[2] = 1e-4
+        elif constraint == 'p1_0':
+            pis[0] = 1e-4
 
-        if init_params is not None:
-            params = init_params.copy()
+        s = pis.sum()
+        if s <= 0:
+            pis = np.array([0.0, 0.0, 0.0, 1.0])
         else:
+            pis = pis / s
+        return pis
+
+
+    def fit(self, y1, y2, constraint=None, init_params=None):
+        y1 = np.asarray(y1)
+        y2 = np.asarray(y2)
+
+        # 1) 初始化 pis
+        self.pis = Smart_Initializer.init_pis_by_counts(y1, y2)
+        self.pis = self._apply_constraint_to_pis(self.pis, constraint)
+
+        # 2) 初始化 params
+        if init_params is None:
             m1_in, t1_in = Smart_Initializer.get_marginal_zinb_params(y1)
             m2_in, t2_in = Smart_Initializer.get_marginal_zinb_params(y2)
-            params = {'m1': m1_in, 't1': t1_in, 'm2': m2_in, 't2': t2_in, 'lam': 0.0}
+            self.params = {'m1': m1_in, 't1': t1_in, 'm2': m2_in, 't2': t2_in, 'lam': 0.0}
+        else:
+            self.params = init_params.copy()
 
-        curr_ll = -np.inf
+        log_lik_history = []
 
         for iteration in range(self.max_iter):
-            lp1 = self.bnb_logpmf(y1, y2, params['m1'], params['t1'], params['m2'], params['t2'], params['lam'])
-            p1 = np.exp(lp1) * pis[0]
-            p2 = np.exp(self.nb_logpmf(y2, params['m2'], params['t2'])) * (y1 == 0) * pis[1]
-            p3 = np.exp(self.nb_logpmf(y1, params['m1'], params['t1'])) * (y2 == 0) * pis[2]
-            p4 = ((y1 == 0) & (y2 == 0)).astype(float) * pis[3]
+            # -------------------------
+            # E-step
+            # -------------------------
+            lp1 = self.bnb_logpmf(
+                y1, y2,
+                self.params['m1'], self.params['t1'],
+                self.params['m2'], self.params['t2'],
+                self.params['lam']
+            )
+            p1 = np.exp(lp1) * self.pis[0]
+
+            # p2: G1 only -> NB(y1) when y2==0
+            p2 = np.exp(self.nb_logpmf(y1, self.params['m1'], self.params['t1'])) * (y2 == 0) * self.pis[1]
+            # p3: G2 only -> NB(y2) when y1==0
+            p3 = np.exp(self.nb_logpmf(y2, self.params['m2'], self.params['t2'])) * (y1 == 0) * self.pis[2]
+            # p4: both zero
+            p4 = ((y1 == 0) & (y2 == 0)).astype(float) * self.pis[3]
 
             total_prob = p1 + p2 + p3 + p4 + 1e-20
-            gamma = np.vstack([p1, p2, p3, p4]) / total_prob
-            gamma = gamma.T
-            pis = gamma.mean(axis=0)
+            gamma = np.vstack([p1, p2, p3, p4]).T / total_prob[:, None]
 
+            # M-step (1): update pis
+            # -------------------------
+            self.pis = gamma.mean(axis=0)
+            self.pis = self._apply_constraint_to_pis(self.pis, constraint)
+
+            # -------------------------
+            # M-step (2): update params via weighted optimizations
+            # -------------------------
+            m1, t1 = self.params['m1'], self.params['t1']
+            m2, t2 = self.params['m2'], self.params['t2']
+            lam = self.params['lam']
+
+            # 权重定义（跟你原逻辑一致）
+            w_corr = gamma[:, 0]               # 只有联合分量才有 correction
+            w1 = gamma[:, 0] + gamma[:, 1]     # y1 的 NB 出现在 p1+p2
+            w2 = gamma[:, 0] + gamma[:, 2]     # y2 的 NB 出现在 p1+p3
+
+            # --- 更新 Gene1 参数：m1,t1 ---
+
+            term2_fixed = self.get_famoye_term(y2, m2, t2)
+
+            def loss_g1(p):
+                ll_nb = np.sum(w1 * self.nb_logpmf(y1, p[0], p[1]))
+                term1 = self.get_famoye_term(y1, p[0], p[1])
+                corr = np.maximum(1 + lam * term1 * term2_fixed, 1e-10)
+                ll_corr = np.sum(w_corr * np.log(corr))
+                return -(ll_nb + ll_corr)
+
+            res1 = minimize(
+                loss_g1, [m1, t1],
+                bounds=[(0.01, 20), (0.01, 0.999)],
+                method='L-BFGS-B'
+            )
+            self.params['m1'], self.params['t1'] = res1.x
+
+            # --- 更新 Gene2 参数：m2,t2 ---
+            term1_fixed = self.get_famoye_term(y1, self.params['m1'], self.params['t1'])
+
+            def loss_g2(p):
+                ll_nb = np.sum(w2 * self.nb_logpmf(y2, p[0], p[1]))
+                term2 = self.get_famoye_term(y2, p[0], p[1])
+                corr = np.maximum(1 + lam * term1_fixed * term2, 1e-10)
+                ll_corr = np.sum(w_corr * np.log(corr))
+
+                return -(ll_nb + ll_corr)
+
+            res2 = minimize(
+                loss_g2, [m2, t2],
+                bounds=[(0.01, 20), (0.01, 0.999)],
+                method='L-BFGS-B'
+            )
+            self.params['m2'], self.params['t2'] = res2.x
+
+            # --- 更新 Lambda ---
+            # 如果 p1 被 constraint 砍掉（p1_0），或 w_corr≈0，则 lam 没有可辨识信息，直接拉回 0 更稳
+            term1_final = self.get_famoye_term(y1, self.params['m1'], self.params['t1'])
+            term2_final = self.get_famoye_term(y2, self.params['m2'], self.params['t2'])
+
+            # def loss_lam(l):
+            #     corr = np.maximum(1 + l[0] * term1_final * term2_final, 1e-10)
+            #     nll = -np.sum(gamma[:, 0] * np.log(corr))
+            #     penalty = self.lambda_reg * (l[0]**2)
+            #     return nll + penalty
+
+            # res_lam = minimize(loss_lam, [lam], bounds=[(-10, 10)], method='L-BFGS-B')
+            # self.params['lam'] = res_lam.x[0]
+
+
+            A = term1_final * term2_final
+            eps_corr = 1e-10  # 你想要的安全下限 eps
+            lb, ub = self._lam_feasible_bounds(A, eps=eps_corr, base_bounds=(-10.0, 10.0))
+
+            # 如果可行区间不存在（很少见，但可能发生），就把 lam 拉回 0（最稳妥）
+            if lb is None:
+                self.params['lam'] = 0.0
+            else:
+                # 让初值落在可行区间内
+                lam0 = float(np.clip(self.params['lam'], lb, ub))
+
+                def loss_lam(l):
+                    # 现在按理论上不应再出现 <=0，但为了数值保险仍然做一次检查
+                    corr = 1.0 + l[0] * A
+                    if np.any(corr <= eps_corr):
+                        return 1e50  # barrier：强行把优化推回可行域
+                    nll = -np.sum(gamma[:, 0] * np.log(corr))
+                    penalty = self.lambda_reg * (l[0] ** 2)  # 你已设为 0 也没关系
+                    return nll + penalty
+
+                res_lam = minimize(loss_lam, [lam0], bounds=[(lb, ub)], method='L-BFGS-B')
+                self.params['lam'] = float(res_lam.x[0])
+
+            # -------------------------
+            # 收敛检查（使用约束后的 total_prob 的 ll）
+            # -------------------------
+            # curr_ll = self._loglik_current(y1, y2, constraint)
             curr_ll = np.sum(np.log(total_prob))
-        return params, pis, curr_ll
+            log_lik_history.append(curr_ll)
+            if iteration > 0 and abs(log_lik_history[-1] - log_lik_history[-2]) < self.tol:
+                break
+
+        return self.params, self.pis, curr_ll
+
+
 
 
 # =====================================================================
@@ -165,18 +316,19 @@ def step3_bivariate_decision(yA, yB, marginal_A, marginal_B, alpha=0.05):
     init_p = {'m1': marginal_A[0], 't1': marginal_A[1],
               'm2': marginal_B[0], 't2': marginal_B[1], 'lam': 0.0}
 
-    params_f, _, ll_full = model_full.fit(yA, yB, init_params=init_p)
+    params_f, _, ll_full = model_full.fit(yA, yB, constraint=None, init_params=init_p)
     _, _, ll_p2_0 = model_restr.fit(yA, yB, constraint='p2_0', init_params=params_f)
     _, _, ll_p3_0 = model_restr.fit(yA, yB, constraint='p3_0', init_params=params_f)
-    _, _, ll_p2p3_0 = model_restr.fit(yA, yB, constraint='p2p3_0', init_params=params_f)
+    # _, _, ll_p2p3_0 = model_restr.fit(yA, yB, constraint='p2p3_0', init_params=params_f)
     _, _, ll_p1_0 = model_restr.fit(yA, yB, constraint='p1_0', init_params=params_f)
 
     accept_p2 = lrt_pvalue(ll_full, ll_p2_0, 1) > alpha
     accept_p3 = lrt_pvalue(ll_full, ll_p3_0, 1) > alpha
-    accept_p2p3 = lrt_pvalue(ll_full, ll_p2p3_0, 2) > alpha
+    # accept_p2p3 = lrt_pvalue(ll_full, ll_p2p3_0, 2) > alpha
 
     # 共表达
-    if accept_p2 and accept_p3 and accept_p2p3:
+    # if accept_p2 and accept_p3 and accept_p2p3:
+    if accept_p2 and accept_p3:
         return "Binary Co-expression (共表达)"
 
     # 包含（XOR）
@@ -273,7 +425,7 @@ def build_three_matrices(results, all_genes):
 def main():
     print("加载数据 adata.h5ad ...")
     try:
-        adata = sc.read_h5ad(r'/home/weixi/Desktop/bivariateZINB/adata.h5ad')
+        adata = sc.read_h5ad(r'../sim_data/adata.h5ad')
         X = adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X
         gene_names = np.array(adata.var_names)
     except FileNotFoundError:
